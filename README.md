@@ -10,7 +10,7 @@ dispath_db_slow.sh
 server.pl
         recvive slow log from client
 
-myslow_collect.pl
+collect_slow_client.pl
 slow.conf
         collect local instance slow log  & config file
 
