@@ -1,0 +1,166 @@
+#!/usr/bin/perl
+# server : recv slow query from client
+# Author : billy @ taomee
+# Email: cracker0@126.com
+
+
+use warnings;
+use strict;
+use DBI; 
+use Data::Dumper;
+
+# t=time, l=lock time, r=rows
+
+my $database='db_slow';
+my $host='192.xx.xx.xx';
+my $port = 'xxx';
+my $user= 'xxx';
+my $password = 'xxx@';
+
+my ($dsn,$dbh, $sth, $count); 
+$dsn = "DBI:mysql:database=$database;host=$host;port=$port";
+$dbh = DBI->connect($dsn, $user, $password,
+	{PrintError => 0, RaiseError => 1}); 
+
+$sth = $dbh->prepare ("INSERT INTO t_slow_log (host_ip, slow_query,count,query_time,lock_time,return_rows,dbuser,host) 
+	VALUES(?,?,?,?,?,?,?,?)"); 
+
+my @pending;
+my %stmt;
+
+# -n NUM    abstract numbers with at least n digits within names
+my $abstract_num_len = 10;
+my $abstract_num_str = 0;
+my $num = 0;
+my $d = 1;
+my $lock_time = 1;
+
+$/ = ";\n#";
+
+while ( defined($_ = shift @pending) or defined($_ = <>) ) 
+{
+	#warn "[[$_]]\n\n" if $d;	# show raw paragraph being read
+
+	my @chunks = split /^\/.*Version.*started with[\000-\377]*?Time.*Id.*Command.*Argument.*\n/m;
+	if (@chunks > 1) 
+	{
+		unshift @pending, map { length($_) ? $_ : () } @chunks;
+		#warn "<<" . join( ">>\n<<" , @chunks) .">>" if $d;
+		next;
+	}
+
+	#  #  Time: 120516    1:02:08
+	s/^#? Time: (\d{6})\s+(\d+:\d+:\d+).*\n//;
+	my ($date, $time) = ($1 , $2);
+	#print "$date, $time\n";
+
+	#                     #  User@ Host:   dbuser[dbuser] @ localhost []
+	my ($user,$host) = s/^#? User\@Host:\s+(\S+)\[\S+\]\s+\@\s+(\S+).*\n// ? ($1,$2) : ('','');
+	# user=dbuser[dbuser], host=localhost
+
+
+
+	#  # Query_time: 2  Lock_time: 0  Rows_sent: 1  Rows_examined: 0
+	s/^# Query_time: (\d+)  Lock_time: (\d+)  Rows_sent: (\d+).*\n//;
+	my ($t, $l, $r) = ($1, $2, $3);
+
+  	# don't subtract lock time from total time
+	$t -= $l unless $lock_time;
+
+	# print "qtime: $t  ltime:$l   sendrows:$r\n";
+
+	# remove fluff that mysqld writes to log when it (re)starts:
+	s!^/.*Version.*started with:.*\n!!mg;
+	s!^Tcp port: \d+  Unix socket: \S+\n!!mg;
+	s!^Time.*Id.*Command.*Argument.*\n!!mg;
+
+	#  use USER_56;
+	s/^use \w+;\n//;	# not consistently added
+	s/^SET timestamp=\d+;\n//;
+
+	s/^[ 	]*\n//mg;	# delete blank lines
+	s/^[ 	]*/  /mg;	# normalize leading whitespace
+	s/\s*;\s*(#\s*)?$//;	# remove trailing semicolon(+newline-hash)
+	
+  	# -g PATTERN   grep: only consider stmts that include this string
+	# next if $opt{g} and !m/$opt{g}/io;
+
+
+  	# -a   don't abstract all numbers to N and strings to 'S'
+	unless ( $abstract_num_str ) 
+	{
+		s/\b\d+\b/N/g;
+		s/\b0x[0-9A-Fa-f]+\b/N/g;
+		s/''/'S'/g;
+		s/""/"S"/g;
+		s/(\\')//g;
+		s/(\\")//g;
+		s/'[^']+'/'S'/g;
+		s/"[^"]+"/"S"/g;
+		# -n=8: turn log_20001231 into log_NNNNNNNN
+		s/([a-z_]+)(\d{$abstract_num_len,})/$1.('N' x length($2))/ieg if $abstract_num_len;
+		# abbreviate massive "in (...)" statements and similar
+		s!(([NS],){100,})!sprintf("$2,{repeated %d times}",length($1)/2)!eg;
+	}
+
+
+	my $s = $stmt{$_} ||= { users=>{}, hosts=>{} };
+
+	$s->{c} += 1;
+
+	$s->{t} += $t;
+	$s->{l} += $l;
+	$s->{r} += $r;
+
+	$s->{users}->{$user}++ if $user;
+	$s->{hosts}->{$host}++ if $host;
+
+#	$s->{q} = $_;
+
+#	print Dumper($s);
+	#warn "{{$_}}\n\n" if $d;	# show processed statement string
+	#last if ( $num++ == 20 ) ;
+}
+
+foreach (keys %stmt) 
+{
+	my $v = $stmt{$_} || die;
+	my ($c, $t, $l, $r) = @{ $v }{qw(c t l r)};
+
+	$v->{at} = $t / $c;
+	$v->{al} = $l / $c;
+	$v->{ar} = $r / $c;
+
+}
+
+
+print "最后结果\n\n\n";
+#print Dumper (%stmt) ;
+
+my @sorted = sort { $stmt{$b}->{t} <=> $stmt{$a}->{t} } keys %stmt;
+
+foreach (@sorted) 
+{
+	my $v = $stmt{$_} || die;
+	my ($c, $t,$at, $l,$al, $r,$ar) = @{ $v }{qw(c t at l al r ar)};
+	my @users = keys %{$v->{users}};
+	my $user  = (@users==1) ? $users[0] : sprintf "%dusers",scalar @users;
+	my @hosts = keys %{$v->{hosts}};
+	my $host  = (@hosts==1) ? $hosts[0] : sprintf "%dhosts",scalar @hosts;
+
+	next if ( $user eq "monitor" or $user eq "backup");
+#	printf "Count: %d  Time=%.2fs (%ds)  Lock=%.2fs (%ds)  Rows=%.1f (%d), $user\@$host\n%s\n\n", $c, $at,  $t,  $al,$l, $ar,$r, $_;
+		$_ =~ s/^\s?//;
+		$_ =~ s/ \+/ /;
+		$_ =~ s/\n+/ /;
+		$host =~ s/\[//;
+		$host =~ s/\]//;
+	$sth->execute ( '192.168.24.168', $_, $c, $at, $al, $ar, $user, $host ); 
+}
+
+
+__DATA__
+Fargo-Moorhead Twins	36	16 
+Winnipeg Maroons	24	26 
+Minot Why Nots	19	23
+
