@@ -36,4 +36,11 @@ setup a mysql instance to collect:
 
 2. dispath stricpts:
         bash dispath_db_slow.sh
-  
+
+##########################################
+数据库慢查询分析系统，功能概述：
+1、	每天定时收集相关数据库的慢查询日志处理后存储到mysql中
+2、	各项目组成员可通常WEB查询本项目相关库的慢查询日志
+3、	DBA会给出影响相对较大的SQL的优化建议
+
+
